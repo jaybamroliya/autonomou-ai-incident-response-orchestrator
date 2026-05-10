@@ -77,10 +77,10 @@ tasks:
           except:
               return {}
 
-      error_data  = safe_parse('''{{ outputs.fetch-error-logs.body }}''')
-      crit_data   = safe_parse('''{{ outputs.fetch-critical-logs.body }}''')
-      metrics     = safe_parse('''{{ outputs.fetch-metrics.body }}''')
-      all_logs    = safe_parse('''{{ outputs.fetch-all-recent-logs.body }}''')
+      error_data  = safe_parse('''{{ outputs['fetch-error-logs'].body }}''')
+      crit_data   = safe_parse('''{{ outputs['fetch-critical-logs'].body }}''')
+      metrics     = safe_parse('''{{ outputs['fetch-metrics'].body }}''')
+      all_logs    = safe_parse('''{{ outputs['fetch-all-recent-logs'].body }}''')
 
       error_logs    = error_data.get("logs", [])
       critical_logs = crit_data.get("logs", [])
@@ -152,9 +152,9 @@ tasks:
     message: |
       ✅ Log collection complete for {{ inputs.incident_id }}
       ─────────────────────────────────────────
-      Errors collected    : {{ outputs.process-and-bundle.vars.error_count }}
-      Critical entries    : {{ outputs.process-and-bundle.vars.critical_count }}
-      Error rate          : {{ outputs.process-and-bundle.vars.error_rate }}%
+      Errors collected    : {{ outputs['process-and-bundle'].vars.error_count }}
+      Critical entries    : {{ outputs['process-and-bundle'].vars.critical_count }}
+      Error rate          : {{ outputs['process-and-bundle'].vars.error_rate }}%
       ─────────────────────────────────────────
       Bundle ready for AI analysis.
 

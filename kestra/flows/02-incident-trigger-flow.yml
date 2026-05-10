@@ -138,8 +138,8 @@ tasks:
     message: |
       📊 INCIDENT CLASSIFIED
       ─────────────────────────────────────────
-      Severity : {{ outputs.classify-severity.vars.severity }}
-      Priority : P{{ outputs.classify-severity.vars.priority }}
-      SLA      : {{ outputs.classify-severity.vars.sla_minutes }} minutes
-      Escalate : {{ outputs.classify-severity.vars.escalate }}
+      Severity : {{ outputs['classify-severity'].vars.severity }}
+      Priority : P{{ outputs['classify-severity'].vars.priority }}
+      SLA      : {{ outputs['classify-severity'].vars.sla_minutes }} minutes
+      Escalate : {{ outputs['classify-severity'].vars.escalate }}
       ─────────────────────────────────────────

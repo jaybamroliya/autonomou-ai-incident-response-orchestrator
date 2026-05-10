@@ -194,11 +194,11 @@ tasks:
     message: |
       ✅ AI Analysis Complete for {{ inputs.incident_id }}
       ─────────────────────────────────────────
-      Severity      : {{ outputs.run-ai-analysis.vars.severity }}
-      Root Cause    : {{ outputs.run-ai-analysis.vars.root_cause_summary }}
-      Est. Fix Time : {{ outputs.run-ai-analysis.vars.resolution_eta }} minutes
-      Business Impact: {{ outputs.run-ai-analysis.vars.business_impact }}
-      Auto-Remediation: {{ outputs.run-ai-analysis.vars.auto_remediation }}
+      Severity      : {{ outputs['run-ai-analysis'].vars.severity }}
+      Root Cause    : {{ outputs['run-ai-analysis'].vars.root_cause_summary }}
+      Est. Fix Time : {{ outputs['run-ai-analysis'].vars.resolution_eta }} minutes
+      Business Impact: {{ outputs['run-ai-analysis'].vars.business_impact }}
+      Auto-Remediation: {{ outputs['run-ai-analysis'].vars.auto_remediation }}
       ─────────────────────────────────────────
 
 errors:

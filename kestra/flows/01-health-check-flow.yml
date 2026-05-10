@@ -54,8 +54,8 @@ tasks:
     script: |
       import json, sys
 
-      status_code = {{ outputs.check-health.code }}
-      body = '''{{ outputs.check-health.body }}'''
+      status_code = {{ outputs['check-health'].code }}
+      body = '''{{ outputs['check-health'].body }}'''
 
       print(f"HTTP Status: {status_code}")
       print(f"Response: {body[:500]}")
@@ -96,7 +96,7 @@ tasks:
 
   - id: route-on-health
     type: io.kestra.plugin.core.flow.If
-    condition: "{{ outputs.evaluate-health.vars.trigger_incident == 'true' }}"
+    condition: "{{ outputs['evaluate-health'].vars.trigger_incident == 'true' }}"
     then:
       - id: log-incident-detected
         type: io.kestra.plugin.core.log.Log
@@ -104,11 +104,11 @@ tasks:
         message: |
           🚨 INCIDENT DETECTED
           ─────────────────────────────────────────
-          Incident ID  : {{ outputs.evaluate-health.vars.incident_id }}
-          Failure Type : {{ outputs.evaluate-health.vars.failure_type }}
-          Component    : {{ outputs.evaluate-health.vars.component }}
-          HTTP Code    : {{ outputs.evaluate-health.vars.http_code }}
-          Error        : {{ outputs.evaluate-health.vars.error_message }}
+          Incident ID  : {{ outputs['evaluate-health'].vars.incident_id }}
+          Failure Type : {{ outputs['evaluate-health'].vars.failure_type }}
+          Component    : {{ outputs['evaluate-health'].vars.component }}
+          HTTP Code    : {{ outputs['evaluate-health'].vars.http_code }}
+          Error        : {{ outputs['evaluate-health'].vars.error_message }}
           ─────────────────────────────────────────
           Firing master orchestration pipeline...
 
@@ -119,11 +119,11 @@ tasks:
         wait: false
         transmitFailed: false
         inputs:
-          incident_id: "{{ outputs.evaluate-health.vars.incident_id }}"
-          failure_type: "{{ outputs.evaluate-health.vars.failure_type }}"
-          component: "{{ outputs.evaluate-health.vars.component }}"
-          error_message: "{{ outputs.evaluate-health.vars.error_message }}"
-          http_code: "{{ outputs.evaluate-health.vars.http_code }}"
+          incident_id: "{{ outputs['evaluate-health'].vars.incident_id }}"
+          failure_type: "{{ outputs['evaluate-health'].vars.failure_type }}"
+          component: "{{ outputs['evaluate-health'].vars.component }}"
+          error_message: "{{ outputs['evaluate-health'].vars.error_message }}"
+          http_code: "{{ outputs['evaluate-health'].vars.http_code }}"
           service_url: "{{ inputs.service_url }}"
 
     else:

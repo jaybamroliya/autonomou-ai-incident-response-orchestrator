@@ -266,8 +266,8 @@ tasks:
     type: io.kestra.plugin.core.log.Log
     message: |
       📄 Incident report generated for {{ inputs.incident_id }}
-      Generated at: {{ outputs.generate-report.vars.generated_at }}
-      File: {{ outputs.generate-report.vars.filename }}
+      Generated at: {{ outputs['generate-report'].vars.generated_at }}
+      File: {{ outputs['generate-report'].vars.filename }}
 
 errors:
   - id: handle-report-error

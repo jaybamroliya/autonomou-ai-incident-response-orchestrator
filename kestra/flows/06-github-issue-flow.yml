@@ -251,8 +251,8 @@ tasks:
   - id: log-issue-result
     type: io.kestra.plugin.core.log.Log
     message: |
-      🐙 GitHub issue: {{ outputs.create-github-issue.vars.status }}
-      Issue URL: {{ outputs.create-github-issue.vars.issue_url }}
+      🐙 GitHub issue: {{ outputs['create-github-issue'].vars.status }}
+      Issue URL: {{ outputs['create-github-issue'].vars.issue_url }}
       Incident : {{ inputs.incident_id }}
 
 errors:

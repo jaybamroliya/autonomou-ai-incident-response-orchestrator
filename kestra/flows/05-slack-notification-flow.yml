@@ -175,7 +175,7 @@ tasks:
   - id: log-notification-result
     type: io.kestra.plugin.core.log.Log
     message: |
-      💬 Slack notification: {{ outputs.build-and-send-alert.vars.status }}
+      💬 Slack notification: {{ outputs['build-and-send-alert'].vars.status }}
       For incident: {{ inputs.incident_id }} ({{ inputs.severity }})
 
 errors:
