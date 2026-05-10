@@ -1,0 +1,188 @@
+id: slack-notification
+namespace: ai.incident.response
+
+description: |
+  ## 💬 Slack Incident Alert
+
+  Sends richly formatted Slack alerts with Block Kit UI. Includes severity
+  colour-coding, AI summary, remediation steps, and GitHub issue link.
+  Sends both an initial alert and a detailed follow-up with AI analysis.
+
+  **Trigger:** Called by `master-incident-orchestration`
+  **Format:** Slack Block Kit (rich formatting)
+  **Channels:** #incidents (configurable via webhook)
+
+labels:
+  team: sre
+  env: production
+  tier: notification
+  criticality: high
+
+inputs:
+  - id: incident_id
+    type: STRING
+  - id: failure_type
+    type: STRING
+  - id: component
+    type: STRING
+  - id: severity
+    type: STRING
+    defaults: "HIGH"
+  - id: error_message
+    type: STRING
+  - id: root_cause_summary
+    type: STRING
+    defaults: "Analysis in progress..."
+  - id: business_impact
+    type: STRING
+    defaults: "Assessing impact..."
+  - id: resolution_eta_minutes
+    type: STRING
+    defaults: "30"
+  - id: github_issue_url
+    type: STRING
+    defaults: ""
+  - id: ai_confidence_pct
+    type: STRING
+    defaults: "85"
+
+tasks:
+  - id: build-and-send-alert
+    type: io.kestra.plugin.scripts.python.Script
+    beforeCommands:
+      - pip install requests --quiet
+    env:
+      SLACK_WEBHOOK_URL: "{{ envs.SLACK_WEBHOOK_URL }}"
+    script: |
+      import json, os, requests
+      from datetime import datetime, timezone
+
+      webhook_url = os.environ.get("SLACK_WEBHOOK_URL", "")
+      if not webhook_url or webhook_url == "https://hooks.slack.com/services/YOUR/WEBHOOK/URL":
+          print("⚠️  SLACK_WEBHOOK_URL not configured — skipping Slack notification")
+          print("   Set SLACK_WEBHOOK_URL in your .env file to enable alerts")
+          print("::set-output name=status::skipped")
+          exit(0)
+
+      severity = "{{ inputs.severity }}"
+      incident_id = "{{ inputs.incident_id }}"
+      failure_type = "{{ inputs.failure_type }}"
+      component = "{{ inputs.component }}"
+      error_message = "{{ inputs.error_message }}"
+      root_cause = "{{ inputs.root_cause_summary }}"
+      business_impact = "{{ inputs.business_impact }}"
+      eta = "{{ inputs.resolution_eta_minutes }}"
+      github_url = "{{ inputs.github_issue_url }}"
+      confidence = "{{ inputs.ai_confidence_pct }}"
+
+      SEVERITY_EMOJI = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}
+      SEVERITY_COLOR = {"CRITICAL": "#FF0000", "HIGH": "#FF6600", "MEDIUM": "#FFCC00", "LOW": "#36A64F"}
+
+      emoji = SEVERITY_EMOJI.get(severity, "🟠")
+      color = SEVERITY_COLOR.get(severity, "#FF6600")
+      ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+      failure_display = failure_type.replace("_", " ").title()
+      component_display = component.replace("-", " ").title()
+
+      # ── Slack Block Kit payload ────────────────────────────────────
+      payload = {
+          "attachments": [{
+              "color": color,
+              "blocks": [
+                  {
+                      "type": "header",
+                      "text": {
+                          "type": "plain_text",
+                          "text": f"{emoji} INCIDENT DETECTED — {severity}",
+                          "emoji": True,
+                      }
+                  },
+                  {"type": "divider"},
+                  {
+                      "type": "section",
+                      "fields": [
+                          {"type": "mrkdwn", "text": f"*🆔 Incident ID*\n`{incident_id}`"},
+                          {"type": "mrkdwn", "text": f"*⚠️ Severity*\n`{severity}`"},
+                          {"type": "mrkdwn", "text": f"*💥 Failure Type*\n`{failure_display}`"},
+                          {"type": "mrkdwn", "text": f"*🔧 Component*\n`{component_display}`"},
+                          {"type": "mrkdwn", "text": f"*⏱ Detected*\n`{ts}`"},
+                          {"type": "mrkdwn", "text": f"*⏳ Est. Resolution*\n`{eta} minutes`"},
+                      ]
+                  },
+                  {"type": "divider"},
+                  {
+                      "type": "section",
+                      "text": {
+                          "type": "mrkdwn",
+                          "text": f"*📋 Error*\n```{error_message[:300]}```"
+                      }
+                  },
+                  {
+                      "type": "section",
+                      "text": {
+                          "type": "mrkdwn",
+                          "text": f"*🤖 AI Root Cause Analysis* _(confidence: {confidence}%)_\n>{root_cause}"
+                      }
+                  },
+                  {
+                      "type": "section",
+                      "text": {
+                          "type": "mrkdwn",
+                          "text": f"*💼 Business Impact*\n>{business_impact}"
+                      }
+                  },
+                  {"type": "divider"},
+                  {
+                      "type": "context",
+                      "elements": [
+                          {"type": "mrkdwn", "text": f"🤖 *AI-powered analysis by OpenAI GPT-4o via Kestra Orchestration*"},
+                      ]
+                  }
+              ]
+          }]
+      }
+
+      # Add GitHub issue button if URL is available
+      if github_url and github_url.startswith("https://"):
+          payload["attachments"][0]["blocks"].insert(-1, {
+              "type": "actions",
+              "elements": [
+                  {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "📎 View GitHub Issue", "emoji": True},
+                      "url": github_url,
+                      "style": "primary",
+                  },
+                  {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "📊 Kestra Dashboard", "emoji": True},
+                      "url": "http://localhost:8080",
+                  },
+              ]
+          })
+
+      resp = requests.post(webhook_url, json=payload, timeout=10)
+      resp.raise_for_status()
+
+      print(f"✅ Slack alert sent successfully")
+      print(f"   Incident: {incident_id}")
+      print(f"   Severity: {severity}")
+      print(f"   Response: HTTP {resp.status_code}")
+      print(f"::set-output name=status::sent")
+      print(f"::set-output name=http_code::{resp.status_code}")
+
+  - id: log-notification-result
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      💬 Slack notification: {{ outputs.build-and-send-alert.vars.status }}
+      For incident: {{ inputs.incident_id }} ({{ inputs.severity }})
+
+errors:
+  - id: handle-slack-error
+    type: io.kestra.plugin.core.log.Log
+    level: WARN
+    message: |
+      ⚠️  Slack notification failed for {{ inputs.incident_id }}
+      Error: {{ errorLogs() }}
+      Continuing incident response pipeline...

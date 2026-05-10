@@ -1,0 +1,118 @@
+version: "3.8"
+
+services:
+
+  # ─────────────────────────────────────────────
+  # PostgreSQL — Kestra backend storage
+  # ─────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: ai-incident-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: kestra
+      POSTGRES_USER: kestra
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kestra_secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kestra"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - incident-net
+
+  # ─────────────────────────────────────────────
+  # Kestra — Workflow Orchestration Engine
+  # ─────────────────────────────────────────────
+  kestra:
+    image: kestra/kestra:latest
+    container_name: ai-incident-kestra
+    restart: unless-stopped
+    user: "root"
+    command: server standalone --worker-thread=128
+    environment:
+      KESTRA_CONFIGURATION: |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://postgres:5432/kestra
+            driverClassName: org.postgresql.Driver
+            username: kestra
+            password: ${POSTGRES_PASSWORD:-kestra_secret}
+        kestra:
+          server:
+            basic-auth:
+              enabled: false
+          repository:
+            type: postgres
+          storage:
+            type: local
+            local:
+              base-path: "/app/storage"
+          queue:
+            type: postgres
+          tasks:
+            tmp-dir:
+              path: /tmp/kestra-wd/tmp
+          url: http://localhost:8080/
+        micronaut:
+          security:
+            enabled: false
+      KESTRA_PLUGINDIRS: /app/plugins
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      GITHUB_REPO: ${GITHUB_REPO}
+      INCIDENT_SERVICE_URL: http://incident-service:8000
+    volumes:
+      - kestra_storage:/app/storage
+      - kestra_tmp:/tmp/kestra-wd
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - incident-net
+
+  # ─────────────────────────────────────────────
+  # Incident Service — FastAPI Mock Service
+  # ─────────────────────────────────────────────
+  incident-service:
+    build:
+      context: ./incident-service
+      dockerfile: Dockerfile
+    container_name: ai-incident-service
+    restart: unless-stopped
+    environment:
+      SERVICE_NAME: payment-api
+      FAILURE_PROBABILITY: "0.3"
+      LATENCY_MS: "50"
+    ports:
+      - "8000:8000"
+    networks:
+      - incident-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # Flow loader removed — flows are loaded via 'make load-flows' after startup
+
+volumes:
+  postgres_data:
+    name: ai-incident-postgres-data
+  kestra_storage:
+    name: ai-incident-kestra-storage
+  kestra_tmp:
+    name: ai-incident-kestra-tmp
+
+networks:
+  incident-net:
+    name: ai-incident-network
+    driver: bridge

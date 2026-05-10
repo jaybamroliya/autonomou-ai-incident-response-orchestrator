@@ -1,0 +1,165 @@
+id: log-collection
+namespace: ai.incident.response
+
+description: |
+  ## 📋 Log Collection & Enrichment
+
+  Collects logs and metrics from the affected service during an active incident.
+  Filters for error/critical entries, extracts patterns, and packages evidence
+  for the AI root-cause analysis engine.
+
+  **Inputs:** Incident ID, service URL
+  **Outputs:** Structured log bundle (JSON) stored as flow output
+  **Consumed by:** `ai-root-cause-analysis`
+
+labels:
+  team: sre
+  env: production
+  tier: data-collection
+  criticality: high
+
+inputs:
+  - id: incident_id
+    type: STRING
+  - id: service_url
+    type: STRING
+    defaults: "{{ envs.INCIDENT_SERVICE_URL }}"
+  - id: failure_type
+    type: STRING
+    defaults: "unknown"
+
+tasks:
+  - id: log-collection-start
+    type: io.kestra.plugin.core.log.Log
+    message: "📋 Starting log collection for incident {{ inputs.incident_id }}"
+
+  - id: collect-in-parallel
+    type: io.kestra.plugin.core.flow.Parallel
+    tasks:
+
+      - id: fetch-error-logs
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.service_url }}/logs?limit=50&level=ERROR"
+        method: GET
+        timeout: PT15S
+        allowFailed: true
+
+      - id: fetch-critical-logs
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.service_url }}/logs?limit=20&level=CRITICAL"
+        method: GET
+        timeout: PT15S
+        allowFailed: true
+
+      - id: fetch-metrics
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.service_url }}/metrics"
+        method: GET
+        timeout: PT15S
+        allowFailed: true
+
+      - id: fetch-all-recent-logs
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.service_url }}/logs?limit=100"
+        method: GET
+        timeout: PT15S
+        allowFailed: true
+
+  - id: process-and-bundle
+    type: io.kestra.plugin.scripts.python.Script
+    script: |
+      import json
+      from datetime import datetime, timezone
+
+      def safe_parse(raw):
+          try:
+              return json.loads(raw if raw else '{}')
+          except:
+              return {}
+
+      error_data  = safe_parse('''{{ outputs.fetch-error-logs.body }}''')
+      crit_data   = safe_parse('''{{ outputs.fetch-critical-logs.body }}''')
+      metrics     = safe_parse('''{{ outputs.fetch-metrics.body }}''')
+      all_logs    = safe_parse('''{{ outputs.fetch-all-recent-logs.body }}''')
+
+      error_logs    = error_data.get("logs", [])
+      critical_logs = crit_data.get("logs", [])
+      recent_logs   = all_logs.get("logs", [])
+
+      # Deduplicate by trace_id
+      seen = set()
+      unique_logs = []
+      for log in (critical_logs + error_logs + recent_logs):
+          tid = log.get("trace_id", log.get("timestamp", ""))
+          if tid not in seen:
+              seen.add(tid)
+              unique_logs.append(log)
+
+      # Sort by timestamp descending
+      unique_logs.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+
+      # Extract error patterns
+      messages = [l.get("message", "") for l in unique_logs if l.get("level") in ("ERROR", "CRITICAL")]
+      patterns = list(dict.fromkeys(messages[:10]))  # preserve order, deduplicate
+
+      # Build evidence bundle
+      bundle = {
+          "incident_id": "{{ inputs.incident_id }}",
+          "failure_type": "{{ inputs.failure_type }}",
+          "collected_at": datetime.now(timezone.utc).isoformat(),
+          "total_logs_collected": len(unique_logs),
+          "error_count": len([l for l in unique_logs if l.get("level") == "ERROR"]),
+          "critical_count": len([l for l in unique_logs if l.get("level") == "CRITICAL"]),
+          "error_patterns": patterns,
+          "metrics": {
+              "error_rate_pct": metrics.get("error_rate_pct", 0),
+              "avg_latency_ms": metrics.get("avg_latency_ms", 0),
+              "p99_latency_ms": metrics.get("p99_latency_ms", 0),
+              "cpu_usage_pct": metrics.get("cpu_usage_pct", 0),
+              "memory_usage_mb": metrics.get("memory_usage_mb", 0),
+              "db_pool_active": metrics.get("db_pool_active", 0),
+              "db_pool_max": metrics.get("db_pool_max", 100),
+              "cache_hit_rate_pct": metrics.get("cache_hit_rate_pct", 0),
+              "gc_pause_ms": metrics.get("gc_pause_ms", 0),
+              "active_connections": metrics.get("active_connections", 0),
+          },
+          "recent_logs": unique_logs[:30],
+          "log_sample_for_ai": "\n".join(
+              f"[{l.get('timestamp','')}] {l.get('level','?'):8s} {l.get('message','')}"
+              for l in unique_logs[:20]
+          ),
+      }
+
+      print(f"📊 Log bundle summary:")
+      print(f"   Total logs    : {bundle['total_logs_collected']}")
+      print(f"   Error count   : {bundle['error_count']}")
+      print(f"   Critical count: {bundle['critical_count']}")
+      print(f"   Error rate    : {bundle['metrics']['error_rate_pct']}%")
+      print(f"   CPU usage     : {bundle['metrics']['cpu_usage_pct']}%")
+      print(f"   Memory        : {bundle['metrics']['memory_usage_mb']} MB")
+      print(f"   DB pool       : {bundle['metrics']['db_pool_active']}/{bundle['metrics']['db_pool_max']}")
+      print(f"\n📋 Error patterns detected:")
+      for i, p in enumerate(patterns[:5], 1):
+          print(f"   {i}. {p[:120]}")
+
+      print(f"::set-output name=bundle_json::{json.dumps(bundle)}")
+      print(f"::set-output name=error_count::{bundle['error_count']}")
+      print(f"::set-output name=critical_count::{bundle['critical_count']}")
+      print(f"::set-output name=error_rate::{bundle['metrics']['error_rate_pct']}")
+
+  - id: log-collection-complete
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      ✅ Log collection complete for {{ inputs.incident_id }}
+      ─────────────────────────────────────────
+      Errors collected    : {{ outputs.process-and-bundle.vars.error_count }}
+      Critical entries    : {{ outputs.process-and-bundle.vars.critical_count }}
+      Error rate          : {{ outputs.process-and-bundle.vars.error_rate }}%
+      ─────────────────────────────────────────
+      Bundle ready for AI analysis.
+
+errors:
+  - id: handle-collection-error
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: "❌ Log collection failed for {{ inputs.incident_id }}: {{ errorLogs() }}"

@@ -1,0 +1,145 @@
+id: incident-trigger
+namespace: ai.incident.response
+
+description: |
+  ## 🚨 Incident Trigger & Classification
+
+  Receives raw incident signals from health checks or external webhooks,
+  enriches them with service metadata, classifies severity, and emits
+  a structured incident event that downstream flows consume.
+
+  **Inputs:** Raw incident signal (failure type, component, HTTP code)
+  **Outputs:** Enriched incident object with severity classification
+  **Downstream:** Feeds `master-incident-orchestration`
+
+labels:
+  team: sre
+  env: production
+  tier: incident-management
+  criticality: critical
+
+inputs:
+  - id: incident_id
+    type: STRING
+    description: Unique incident identifier (e.g. INC-A3F2B1C0)
+  - id: failure_type
+    type: STRING
+    description: Machine-readable failure category
+  - id: component
+    type: STRING
+    description: Affected service component
+  - id: error_message
+    type: STRING
+    description: Human-readable error description
+  - id: http_code
+    type: STRING
+    defaults: "503"
+  - id: service_url
+    type: STRING
+    defaults: "{{ envs.INCIDENT_SERVICE_URL }}"
+
+tasks:
+  - id: log-trigger-received
+    type: io.kestra.plugin.core.log.Log
+    level: WARN
+    message: |
+      🚨 INCIDENT TRIGGER RECEIVED
+      ════════════════════════════════════════
+      ID          : {{ inputs.incident_id }}
+      Failure     : {{ inputs.failure_type }}
+      Component   : {{ inputs.component }}
+      HTTP Code   : {{ inputs.http_code }}
+      Message     : {{ inputs.error_message }}
+      ════════════════════════════════════════
+
+  - id: classify-severity
+    type: io.kestra.plugin.scripts.python.Script
+    script: |
+      import json
+      from datetime import datetime, timezone
+
+      failure_type = "{{ inputs.failure_type }}"
+      http_code = int("{{ inputs.http_code }}" or "503")
+      component = "{{ inputs.component }}"
+      error_message = "{{ inputs.error_message }}"
+
+      # Severity classification matrix
+      CRITICAL_PATTERNS = [
+          "database_connection_pool_exhausted",
+          "memory_leak_oom",
+          "disk_io_saturation",
+      ]
+      HIGH_PATTERNS = [
+          "downstream_api_timeout",
+          "rate_limit_cascade",
+          "certificate_expiry",
+      ]
+
+      if failure_type in CRITICAL_PATTERNS or http_code >= 500:
+          severity = "CRITICAL"
+          priority = 1
+          sla_minutes = 15
+          escalate = True
+      elif failure_type in HIGH_PATTERNS or http_code in (429, 495, 504):
+          severity = "HIGH"
+          priority = 2
+          sla_minutes = 30
+          escalate = True
+      elif http_code >= 400:
+          severity = "MEDIUM"
+          priority = 3
+          sla_minutes = 60
+          escalate = False
+      else:
+          severity = "LOW"
+          priority = 4
+          sla_minutes = 240
+          escalate = False
+
+      # Affected service metadata
+      SERVICE_MAP = {
+          "postgres-primary": "Payment Processing Database",
+          "jvm-runtime": "Payment API Runtime",
+          "stripe-client": "Stripe Payment Gateway",
+          "storage-layer": "Persistent Storage",
+          "tls-terminator": "TLS/SSL Termination Layer",
+          "http-client": "Outbound HTTP Client",
+      }
+      service_display = SERVICE_MAP.get(component, component)
+
+      incident = {
+          "incident_id": "{{ inputs.incident_id }}",
+          "failure_type": failure_type,
+          "component": component,
+          "service_display": service_display,
+          "error_message": error_message,
+          "http_code": http_code,
+          "severity": severity,
+          "priority": priority,
+          "sla_minutes": sla_minutes,
+          "escalate": escalate,
+          "detected_at": datetime.now(timezone.utc).isoformat(),
+          "runbook_url": f"https://runbooks.internal/incidents/{failure_type.replace('_', '-')}",
+      }
+
+      print(json.dumps(incident, indent=2))
+      print(f"::set-output name=severity::{severity}")
+      print(f"::set-output name=priority::{priority}")
+      print(f"::set-output name=sla_minutes::{sla_minutes}")
+      print(f"::set-output name=escalate::{escalate}")
+      print(f"::set-output name=incident_json::{json.dumps(incident)}")
+      print(f"\n📊 Severity Classification: {severity} (P{priority})")
+      print(f"   SLA Response Time: {sla_minutes} minutes")
+      print(f"   Escalation Required: {escalate}")
+
+  - id: log-classification
+    type: io.kestra.plugin.core.log.Log
+    level: WARN
+    message: |
+      📊 INCIDENT CLASSIFIED
+      ─────────────────────────────────────────
+      Severity : {{ outputs.classify-severity.vars.severity }}
+      Priority : P{{ outputs.classify-severity.vars.priority }}
+      SLA      : {{ outputs.classify-severity.vars.sla_minutes }} minutes
+      Escalate : {{ outputs.classify-severity.vars.escalate }}
+      ─────────────────────────────────────────

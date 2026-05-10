@@ -1,0 +1,141 @@
+id: health-check
+namespace: ai.incident.response
+
+description: |
+  ## 🔍 Continuous Health Monitor
+
+  Polls the target service every 60 seconds and evaluates its health status.
+  On failure detection, automatically triggers the master incident orchestration pipeline.
+
+  **Trigger:** Schedule (every 60 seconds)
+  **On failure:** Fires `incident-trigger` subflow
+  **SLO:** Must complete within 10 seconds
+
+labels:
+  team: sre
+  env: production
+  tier: monitoring
+  criticality: high
+
+inputs:
+  - id: service_url
+    type: STRING
+    defaults: "{{ envs.INCIDENT_SERVICE_URL }}"
+    description: Base URL of the monitored service
+
+triggers:
+  - id: every-minute
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "* * * * *"
+    description: Poll health every 60 seconds
+
+tasks:
+  - id: log-check-start
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      🔍 Health check starting for {{ inputs.service_url }}
+      Timestamp: {{ now() }}
+
+  - id: check-health
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ inputs.service_url }}/health"
+    method: GET
+    timeout: PT10S
+    allowFailed: true
+    retry:
+      type: constant
+      interval: PT3S
+      maxAttempt: 2
+
+  - id: evaluate-health
+    type: io.kestra.plugin.scripts.python.Script
+    beforeCommands:
+      - pip install requests --quiet
+    script: |
+      import json, sys
+
+      status_code = {{ outputs.check-health.code }}
+      body = '''{{ outputs.check-health.body }}'''
+
+      print(f"HTTP Status: {status_code}")
+      print(f"Response: {body[:500]}")
+
+      is_healthy = status_code == 200
+
+      if is_healthy:
+          print("✅ Service is HEALTHY")
+          kv = {"health_status": "healthy", "trigger_incident": "false", "http_code": str(status_code)}
+      else:
+          print(f"🚨 Service is UNHEALTHY — HTTP {status_code}")
+          try:
+              data = json.loads(body)
+              incident_id = data.get("detail", {}).get("incident_id", "INC-UNKNOWN")
+              failure_type = data.get("detail", {}).get("failure_type", "unknown")
+              component = data.get("detail", {}).get("component", "unknown")
+              message = data.get("detail", {}).get("message", "Service unhealthy")
+          except:
+              incident_id = "INC-UNKNOWN"
+              failure_type = "unknown"
+              component = "unknown"
+              message = f"HTTP {status_code} returned"
+          kv = {
+              "health_status": "unhealthy",
+              "trigger_incident": "true",
+              "http_code": str(status_code),
+              "incident_id": incident_id,
+              "failure_type": failure_type,
+              "component": component,
+              "error_message": message,
+          }
+          print(f"  Incident ID : {incident_id}")
+          print(f"  Failure Type: {failure_type}")
+          print(f"  Component   : {component}")
+
+      for k, v in kv.items():
+          print(f"::set-output name={k}::{v}")
+
+  - id: route-on-health
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.evaluate-health.vars.trigger_incident == 'true' }}"
+    then:
+      - id: log-incident-detected
+        type: io.kestra.plugin.core.log.Log
+        level: WARN
+        message: |
+          🚨 INCIDENT DETECTED
+          ─────────────────────────────────────────
+          Incident ID  : {{ outputs.evaluate-health.vars.incident_id }}
+          Failure Type : {{ outputs.evaluate-health.vars.failure_type }}
+          Component    : {{ outputs.evaluate-health.vars.component }}
+          HTTP Code    : {{ outputs.evaluate-health.vars.http_code }}
+          Error        : {{ outputs.evaluate-health.vars.error_message }}
+          ─────────────────────────────────────────
+          Firing master orchestration pipeline...
+
+      - id: trigger-incident-response
+        type: io.kestra.plugin.core.flow.Subflow
+        namespace: ai.incident.response
+        flowId: master-incident-orchestration
+        wait: false
+        transmitFailed: false
+        inputs:
+          incident_id: "{{ outputs.evaluate-health.vars.incident_id }}"
+          failure_type: "{{ outputs.evaluate-health.vars.failure_type }}"
+          component: "{{ outputs.evaluate-health.vars.component }}"
+          error_message: "{{ outputs.evaluate-health.vars.error_message }}"
+          http_code: "{{ outputs.evaluate-health.vars.http_code }}"
+          service_url: "{{ inputs.service_url }}"
+
+    else:
+      - id: log-healthy
+        type: io.kestra.plugin.core.log.Log
+        message: "✅ Health check passed — service is operating normally"
+
+errors:
+  - id: handle-check-error
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: |
+      ❌ Health check flow failed unexpectedly
+      Error: {{ errorLogs() }}
+      Treating as unhealthy and firing incident response...

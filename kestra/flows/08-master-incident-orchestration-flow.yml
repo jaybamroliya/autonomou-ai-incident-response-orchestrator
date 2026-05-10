@@ -1,0 +1,702 @@
+id: master-incident-orchestration
+namespace: ai.incident.response
+
+description: |
+  ## 🎯 Master Incident Orchestration Pipeline
+
+  The central orchestration hub for automated incident response.
+  Coordinates the full incident lifecycle from detection to resolution:
+
+  1. **Classify** — Determines severity and priority
+  2. **Collect** — Gathers logs and metrics in parallel
+  3. **Analyze** — AI-powered root cause analysis (GPT-4o)
+  4. **Notify** — Parallel: Slack alert + GitHub issue creation
+  5. **Report** — Generates enterprise incident report
+  6. **Summarize** — Final orchestration summary log
+
+  **Trigger:** Called by `health-check` flow on failure detection
+  **Duration:** ~30-60 seconds end-to-end
+  **Integrations:** FastAPI → OpenAI → Slack → GitHub
+
+labels:
+  team: sre
+  env: production
+  tier: orchestration
+  criticality: critical
+  ai-powered: "true"
+  event-driven: "true"
+
+inputs:
+  - id: incident_id
+    type: STRING
+    description: "Unique incident ID from health check (e.g. INC-A3F2B1C0)"
+  - id: failure_type
+    type: STRING
+    description: "Machine-readable failure type"
+  - id: component
+    type: STRING
+    description: "Affected component name"
+  - id: error_message
+    type: STRING
+    description: "Human-readable error message"
+  - id: http_code
+    type: STRING
+    defaults: "503"
+  - id: service_url
+    type: STRING
+    defaults: "{{ envs.INCIDENT_SERVICE_URL }}"
+
+tasks:
+
+  # ══════════════════════════════════════════════════════════════
+  #  STAGE 1 — INCIDENT INTAKE & CLASSIFICATION
+  # ══════════════════════════════════════════════════════════════
+  - id: stage-1-classify
+    type: io.kestra.plugin.core.log.Log
+    level: WARN
+    message: |
+      ╔══════════════════════════════════════════════════════════╗
+      ║     🚨 INCIDENT RESPONSE PIPELINE ACTIVATED             ║
+      ╠══════════════════════════════════════════════════════════╣
+      ║  Incident ID  : {{ inputs.incident_id }}
+      ║  Failure Type : {{ inputs.failure_type }}
+      ║  Component    : {{ inputs.component }}
+      ║  HTTP Code    : {{ inputs.http_code }}
+      ║  Service URL  : {{ inputs.service_url }}
+      ╚══════════════════════════════════════════════════════════╝
+
+  - id: classify-incident
+    type: io.kestra.plugin.scripts.python.Script
+    script: |
+      import json
+      from datetime import datetime, timezone
+
+      failure_type = "{{ inputs.failure_type }}"
+      http_code = int("{{ inputs.http_code }}" or "503")
+
+      CRITICAL = ["database_connection_pool_exhausted", "memory_leak_oom", "disk_io_saturation"]
+      HIGH     = ["downstream_api_timeout", "certificate_expiry", "rate_limit_cascade"]
+
+      if failure_type in CRITICAL or http_code >= 500:
+          severity, priority, sla = "CRITICAL", 1, 15
+      elif failure_type in HIGH or http_code in (429, 495, 504):
+          severity, priority, sla = "HIGH", 2, 30
+      else:
+          severity, priority, sla = "MEDIUM", 3, 60
+
+      detected_at = datetime.now(timezone.utc).isoformat()
+
+      print(f"📊 Classification: {severity} (P{priority}) — SLA {sla} min")
+      print(f"::set-output name=severity::{severity}")
+      print(f"::set-output name=priority::{priority}")
+      print(f"::set-output name=sla_minutes::{sla}")
+      print(f"::set-output name=detected_at::{detected_at}")
+
+  - id: log-severity
+    type: io.kestra.plugin.core.log.Log
+    level: WARN
+    message: |
+      📊 STAGE 1 COMPLETE — Incident Classified
+         Severity : {{ outputs.classify-incident.vars.severity }}
+         Priority : P{{ outputs.classify-incident.vars.priority }}
+         SLA      : {{ outputs.classify-incident.vars.sla_minutes }} minutes
+
+  # ══════════════════════════════════════════════════════════════
+  #  STAGE 2 — LOG & METRICS COLLECTION
+  # ══════════════════════════════════════════════════════════════
+  - id: stage-2-collect
+    type: io.kestra.plugin.core.log.Log
+    message: "📋 STAGE 2 — Collecting logs and metrics from {{ inputs.service_url }}..."
+
+  - id: collect-logs-and-metrics
+    type: io.kestra.plugin.core.flow.Parallel
+    tasks:
+
+      - id: fetch-error-logs
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.service_url }}/logs?limit=50&level=ERROR"
+        method: GET
+        timeout: PT15S
+        allowFailed: true
+
+      - id: fetch-critical-logs
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.service_url }}/logs?limit=20&level=CRITICAL"
+        method: GET
+        timeout: PT15S
+        allowFailed: true
+
+      - id: fetch-service-metrics
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.service_url }}/metrics"
+        method: GET
+        timeout: PT15S
+        allowFailed: true
+
+  - id: build-log-bundle
+    type: io.kestra.plugin.scripts.python.Script
+    script: |
+      import json
+      from datetime import datetime, timezone
+
+      def safe_parse(raw):
+          try:
+              return json.loads(raw if raw else '{}')
+          except:
+              return {}
+
+      err_data  = safe_parse('''{{ outputs.fetch-error-logs.body }}''')
+      crit_data = safe_parse('''{{ outputs.fetch-critical-logs.body }}''')
+      metrics   = safe_parse('''{{ outputs.fetch-service-metrics.body }}''')
+
+      err_logs  = err_data.get("logs", [])
+      crit_logs = crit_data.get("logs", [])
+
+      seen, unique = set(), []
+      for log in (crit_logs + err_logs):
+          tid = log.get("trace_id", log.get("timestamp", ""))
+          if tid not in seen:
+              seen.add(tid)
+              unique.append(log)
+      unique.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+
+      messages = [l.get("message", "") for l in unique if l.get("level") in ("ERROR", "CRITICAL")]
+      patterns = list(dict.fromkeys(messages[:10]))
+
+      log_sample = "\n".join(
+          f"[{l.get('timestamp','')}] {l.get('level','?'):8s} {l.get('message','')}"
+          for l in unique[:20]
+      )
+
+      bundle = {
+          "incident_id": "{{ inputs.incident_id }}",
+          "failure_type": "{{ inputs.failure_type }}",
+          "collected_at": datetime.now(timezone.utc).isoformat(),
+          "total_logs": len(unique),
+          "error_count": len([l for l in unique if l.get("level") == "ERROR"]),
+          "critical_count": len([l for l in unique if l.get("level") == "CRITICAL"]),
+          "error_patterns": patterns,
+          "metrics": {
+              "error_rate_pct": metrics.get("error_rate_pct", 0),
+              "avg_latency_ms": metrics.get("avg_latency_ms", 0),
+              "p99_latency_ms": metrics.get("p99_latency_ms", 0),
+              "cpu_usage_pct": metrics.get("cpu_usage_pct", 0),
+              "memory_usage_mb": metrics.get("memory_usage_mb", 0),
+              "db_pool_active": metrics.get("db_pool_active", 0),
+              "db_pool_max": metrics.get("db_pool_max", 100),
+              "cache_hit_rate_pct": metrics.get("cache_hit_rate_pct", 0),
+              "gc_pause_ms": metrics.get("gc_pause_ms", 0),
+          },
+          "recent_logs": unique[:30],
+          "log_sample_for_ai": log_sample,
+      }
+
+      print(f"📦 Log bundle: {bundle['error_count']} errors, {bundle['critical_count']} critical")
+      print(f"   Error rate: {bundle['metrics']['error_rate_pct']}%  CPU: {bundle['metrics']['cpu_usage_pct']}%")
+      print(f"::set-output name=bundle_json::{json.dumps(bundle)}")
+      print(f"::set-output name=error_count::{bundle['error_count']}")
+
+  - id: log-collection-done
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      ✅ STAGE 2 COMPLETE — Log collection done
+         Errors : {{ outputs.build-log-bundle.vars.error_count }}
+
+  # ══════════════════════════════════════════════════════════════
+  #  STAGE 3 — AI ROOT CAUSE ANALYSIS
+  # ══════════════════════════════════════════════════════════════
+  - id: stage-3-analyze
+    type: io.kestra.plugin.core.log.Log
+    message: "🤖 STAGE 3 — Running AI root cause analysis with GPT-4o..."
+
+  - id: ai-analyze
+    type: io.kestra.plugin.scripts.python.Script
+    beforeCommands:
+      - pip install openai --quiet
+    env:
+      OPENAI_API_KEY: "{{ envs.OPENAI_API_KEY }}"
+    script: |
+      import json, os
+      from datetime import datetime, timezone
+      from openai import OpenAI
+
+      api_key = os.environ.get("OPENAI_API_KEY", "")
+      if not api_key or api_key == "sk-proj-your-key-here":
+          print("⚠️  OpenAI API key not configured — using mock analysis")
+          mock = {
+              "root_cause": {
+                  "summary": f"Mock analysis: {{ inputs.failure_type }} detected in {{ inputs.component }}",
+                  "technical_detail": "Configure OPENAI_API_KEY for real AI analysis.",
+                  "contributing_factors": ["API key not configured"],
+                  "confidence_pct": 0,
+              },
+              "severity_assessment": {"level": "{{ outputs.classify-incident.vars.severity }}", "slo_breach": True, "blast_radius": "Unknown"},
+              "business_impact": {"summary": "Configure OpenAI API key for impact analysis", "customer_facing": True, "affected_users_estimate": "Unknown", "revenue_risk": "Unknown"},
+              "remediation": {
+                  "immediate_actions": [{"step": 1, "action": "Configure OPENAI_API_KEY and re-run", "eta_minutes": 5}],
+                  "short_term_fixes": [], "long_term_prevention": [], "estimated_resolution_minutes": 30
+              },
+              "incident_id": "{{ inputs.incident_id }}",
+              "analyzed_at": datetime.now(timezone.utc).isoformat(),
+              "model_used": "mock",
+              "ai_confidence_score": 0.0,
+              "auto_remediation_possible": False,
+          }
+          print(f"::set-output name=analysis_json::{json.dumps(mock)}")
+          print(f"::set-output name=severity::{{ outputs.classify-incident.vars.severity }}")
+          print(f"::set-output name=root_cause_summary::Mock analysis — configure OpenAI API key")
+          print(f"::set-output name=resolution_eta::30")
+          print(f"::set-output name=business_impact::Configure OpenAI API key for analysis")
+          print(f"::set-output name=confidence_pct::0")
+          exit(0)
+
+      client = OpenAI(api_key=api_key)
+
+      try:
+          bundle = json.loads('''{{ outputs.build-log-bundle.vars.bundle_json }}''')
+      except:
+          bundle = {}
+
+      metrics = bundle.get("metrics", {})
+      log_sample = bundle.get("log_sample_for_ai", "{{ inputs.error_message }}")
+      error_patterns = bundle.get("error_patterns", ["{{ inputs.error_message }}"])
+
+      failure_type = "{{ inputs.failure_type }}"
+
+      system_prompt = """You are an expert SRE and AI incident analyst. Analyze production incidents with precision.
+      Always respond with valid JSON matching the exact schema requested. Be specific, technical, and actionable."""
+
+      user_prompt = f"""Analyze this production incident comprehensively.
+
+      INCIDENT: {{"id": "{{ inputs.incident_id }}", "failure_type": "{failure_type}", "component": "{{ inputs.component }}", "error": "{{ inputs.error_message }}", "severity": "{{ outputs.classify-incident.vars.severity }}"}}
+
+      METRICS: error_rate={metrics.get('error_rate_pct')}%, latency_p99={metrics.get('p99_latency_ms')}ms, cpu={metrics.get('cpu_usage_pct')}%, mem={metrics.get('memory_usage_mb')}MB, db_pool={metrics.get('db_pool_active')}/{metrics.get('db_pool_max',100)}, cache_hit={metrics.get('cache_hit_rate_pct')}%
+
+      LOGS (recent):
+      {log_sample[:1500]}
+
+      ERROR PATTERNS: {'; '.join(error_patterns[:5])}
+
+      Respond with ONLY this JSON schema:
+      {{"root_cause":{{"summary":"string","technical_detail":"string","contributing_factors":["str"],"confidence_pct":85}},"severity_assessment":{{"level":"CRITICAL|HIGH|MEDIUM|LOW","justification":"string","blast_radius":"string","slo_breach":true}},"business_impact":{{"summary":"string","affected_users_estimate":"string","revenue_risk":"string","compliance_risk":"string","customer_facing":true}},"remediation":{{"immediate_actions":[{{"step":1,"action":"string","command":"string","eta_minutes":5}}],"short_term_fixes":["str"],"long_term_prevention":["str"],"estimated_resolution_minutes":30,"rollback_available":true}},"runbook_reference":"string","auto_remediation_possible":true,"ai_confidence_score":0.87}}"""
+
+      print("🤖 Calling OpenAI GPT-4o...")
+      response = client.chat.completions.create(
+          model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+          messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+          temperature=0.2, max_tokens=2000, response_format={"type": "json_object"},
+      )
+
+      analysis = json.loads(response.choices[0].message.content)
+      analysis.update({"incident_id": "{{ inputs.incident_id }}", "analyzed_at": datetime.now(timezone.utc).isoformat(), "model_used": "gpt-4o", "tokens_used": response.usage.total_tokens})
+
+      sev = analysis.get("severity_assessment", {}).get("level", "{{ outputs.classify-incident.vars.severity }}")
+      summary = analysis.get("root_cause", {}).get("summary", "")
+      eta = analysis.get("remediation", {}).get("estimated_resolution_minutes", 30)
+      impact = analysis.get("business_impact", {}).get("summary", "")
+      confidence = int(analysis.get("ai_confidence_score", 0.85) * 100)
+
+      print(f"\n{'═'*55}")
+      print(f"  ✅ AI ANALYSIS COMPLETE")
+      print(f"{'═'*55}")
+      print(f"  Severity  : {sev}")
+      print(f"  Confidence: {confidence}%")
+      print(f"  Root Cause: {summary[:80]}...")
+      print(f"  Impact    : {impact[:80]}...")
+      print(f"  Fix ETA   : {eta} min")
+      print(f"  Tokens    : {analysis['tokens_used']}")
+      print(f"{'═'*55}")
+
+      print(f"::set-output name=analysis_json::{json.dumps(analysis)}")
+      print(f"::set-output name=severity::{sev}")
+      print(f"::set-output name=root_cause_summary::{summary}")
+      print(f"::set-output name=resolution_eta::{eta}")
+      print(f"::set-output name=business_impact::{impact}")
+      print(f"::set-output name=confidence_pct::{confidence}")
+
+  - id: log-analysis-done
+    type: io.kestra.plugin.core.log.Log
+    level: WARN
+    message: |
+      ✅ STAGE 3 COMPLETE — AI Analysis Done
+         Severity   : {{ outputs.ai-analyze.vars.severity }}
+         Root Cause : {{ outputs.ai-analyze.vars.root_cause_summary }}
+         Fix ETA    : {{ outputs.ai-analyze.vars.resolution_eta }} min
+
+  # ══════════════════════════════════════════════════════════════
+  #  STAGE 4 — PARALLEL NOTIFICATIONS (Slack + GitHub)
+  # ══════════════════════════════════════════════════════════════
+  - id: stage-4-notify
+    type: io.kestra.plugin.core.log.Log
+    message: "📣 STAGE 4 — Firing parallel notifications (Slack + GitHub)..."
+
+  - id: create-github-issue
+    type: io.kestra.plugin.scripts.python.Script
+    beforeCommands:
+      - pip install requests --quiet
+    env:
+      GITHUB_TOKEN: "{{ envs.GITHUB_TOKEN }}"
+      GITHUB_REPO: "{{ envs.GITHUB_REPO }}"
+    script: |
+      import json, os, requests, textwrap
+      from datetime import datetime, timezone
+
+      token = os.environ.get("GITHUB_TOKEN", "")
+      repo  = os.environ.get("GITHUB_REPO", "")
+
+      if not token or token == "ghp_your_github_token_here" or not repo or "/" not in repo:
+          print("⚠️  GitHub not configured — skipping issue creation")
+          print("::set-output name=issue_url::")
+          print("::set-output name=status::skipped")
+          exit(0)
+
+      try:
+          analysis = json.loads('''{{ outputs.ai-analyze.vars.analysis_json }}''')
+      except:
+          analysis = {}
+      try:
+          bundle = json.loads('''{{ outputs.build-log-bundle.vars.bundle_json }}''')
+      except:
+          bundle = {}
+
+      severity     = "{{ outputs.ai-analyze.vars.severity }}"
+      incident_id  = "{{ inputs.incident_id }}"
+      failure_type = "{{ inputs.failure_type }}"
+      component    = "{{ inputs.component }}"
+      ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+      metrics = bundle.get("metrics", {})
+      rc = analysis.get("root_cause", {})
+      rem = analysis.get("remediation", {})
+      biz = analysis.get("business_impact", {})
+      sev_a = analysis.get("severity_assessment", {})
+      failure_display = failure_type.replace("_", " ").title()
+      component_display = component.replace("-", " ").title()
+
+      BADGE = {"CRITICAL":"![CRITICAL](https://img.shields.io/badge/severity-CRITICAL-red)","HIGH":"![HIGH](https://img.shields.io/badge/severity-HIGH-orange)","MEDIUM":"![MEDIUM](https://img.shields.io/badge/severity-MEDIUM-yellow)","LOW":"![LOW](https://img.shields.io/badge/severity-LOW-green)"}
+
+      actions_md = "\n".join(
+          f"- [ ] **Step {a.get('step',i+1)}** ({a.get('eta_minutes','?')} min): {a.get('action','')}" + (f"\n  ```bash\n  {a['command']}\n  ```" if a.get('command') else "")
+          for i, a in enumerate(rem.get("immediate_actions", [])[:5])
+      ) or "- [ ] Escalate to on-call engineer"
+
+      body = textwrap.dedent(f"""
+      ## {BADGE.get(severity, '')} Incident: `{incident_id}`
+      > *Auto-generated by Autonomous AI Incident Response Orchestrator — Kestra + OpenAI GPT-4o*
+
+      | Field | Value |
+      |-------|-------|
+      | **Severity** | **{severity}** |
+      | **Failure** | `{failure_display}` |
+      | **Component** | `{component_display}` |
+      | **Detected** | `{ts}` |
+      | **SLO Breach** | `{sev_a.get('slo_breach', 'Unknown')}` |
+      | **ETA Fix** | `{rem.get('estimated_resolution_minutes', 'TBD')} min` |
+
+      ## 🤖 AI Root Cause (GPT-4o, {int(analysis.get('ai_confidence_score', 0) * 100)}% confidence)
+      {rc.get('summary', 'Analysis pending')}
+
+      **Technical detail:** {rc.get('technical_detail', '')}
+
+      ## 💼 Business Impact
+      {biz.get('summary', 'Under assessment')} | Users: {biz.get('affected_users_estimate','TBD')} | Revenue: {biz.get('revenue_risk','TBD')}
+
+      ## 🔧 Immediate Actions
+      {actions_md}
+
+      ## 📊 Key Metrics
+      Error rate: `{metrics.get('error_rate_pct','N/A')}%` | P99: `{metrics.get('p99_latency_ms','N/A')}ms` | CPU: `{metrics.get('cpu_usage_pct','N/A')}%` | DB Pool: `{metrics.get('db_pool_active','N/A')}/{metrics.get('db_pool_max',100)}`
+
+      ---
+      *[Kestra Dashboard](http://localhost:8080) | [Service Logs](http://localhost:8000/logs)*
+      """).strip()
+
+      LABELS = {"CRITICAL":["incident","severity: critical","priority: p1"],"HIGH":["incident","severity: high","priority: p2"],"MEDIUM":["incident","severity: medium","priority: p3"],"LOW":["incident","severity: low"]}
+      resp = requests.post(
+          f"https://api.github.com/repos/{repo}/issues",
+          json={"title": f"[{severity}] {incident_id}: {failure_display} — {component_display}", "body": body, "labels": LABELS.get(severity, ["incident"])},
+          headers={"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"},
+          timeout=15,
+      )
+      if resp.status_code == 201:
+          data = resp.json()
+          print(f"✅ GitHub issue #{data['number']}: {data['html_url']}")
+          print(f"::set-output name=issue_url::{data['html_url']}")
+          print(f"::set-output name=status::created")
+      else:
+          print(f"❌ GitHub API error {resp.status_code}")
+          print(f"::set-output name=issue_url::")
+          print(f"::set-output name=status::error")
+
+  - id: send-slack-alert
+    type: io.kestra.plugin.scripts.python.Script
+    beforeCommands:
+      - pip install requests --quiet
+    env:
+      SLACK_WEBHOOK_URL: "{{ envs.SLACK_WEBHOOK_URL }}"
+    script: |
+      import json, os, requests
+      from datetime import datetime, timezone
+
+      webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
+      if not webhook or "YOUR/WEBHOOK" in webhook:
+          print("⚠️  Slack webhook not configured — skipping")
+          print("::set-output name=status::skipped")
+          exit(0)
+
+      severity     = "{{ outputs.ai-analyze.vars.severity }}"
+      incident_id  = "{{ inputs.incident_id }}"
+      failure_type = "{{ inputs.failure_type }}"
+      component    = "{{ inputs.component }}"
+      root_cause   = "{{ outputs.ai-analyze.vars.root_cause_summary }}"
+      impact       = "{{ outputs.ai-analyze.vars.business_impact }}"
+      eta          = "{{ outputs.ai-analyze.vars.resolution_eta }}"
+      confidence   = "{{ outputs.ai-analyze.vars.confidence_pct }}"
+      github_url   = "{{ outputs.create-github-issue.vars.issue_url }}"
+      ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+      EMOJI  = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","LOW":"🟢"}
+      COLOR  = {"CRITICAL":"#FF0000","HIGH":"#FF6600","MEDIUM":"#FFCC00","LOW":"#36A64F"}
+      e = EMOJI.get(severity, "🟠")
+      c = COLOR.get(severity, "#FF6600")
+      fd = failure_type.replace("_"," ").title()
+      cd = component.replace("-"," ").title()
+
+      blocks = [
+          {"type":"header","text":{"type":"plain_text","text":f"{e} INCIDENT — {severity}: {incident_id}","emoji":True}},
+          {"type":"divider"},
+          {"type":"section","fields":[
+              {"type":"mrkdwn","text":f"*💥 Failure*\n`{fd}`"},
+              {"type":"mrkdwn","text":f"*🔧 Component*\n`{cd}`"},
+              {"type":"mrkdwn","text":f"*⏱ Detected*\n`{ts}`"},
+              {"type":"mrkdwn","text":f"*⏳ ETA Fix*\n`{eta} min`"},
+          ]},
+          {"type":"divider"},
+          {"type":"section","text":{"type":"mrkdwn","text":f"*🤖 AI Root Cause* _(confidence: {confidence}%)_\n>{root_cause}"}},
+          {"type":"section","text":{"type":"mrkdwn","text":f"*💼 Business Impact*\n>{impact}"}},
+      ]
+      if github_url and github_url.startswith("https://"):
+          blocks.append({"type":"actions","elements":[
+              {"type":"button","text":{"type":"plain_text","text":"📎 GitHub Issue","emoji":True},"url":github_url,"style":"primary"},
+              {"type":"button","text":{"type":"plain_text","text":"📊 Kestra Dashboard","emoji":True},"url":"http://localhost:8080"},
+          ]})
+      blocks.append({"type":"context","elements":[{"type":"mrkdwn","text":"🤖 *AI-powered by Kestra + OpenAI GPT-4o*"}]})
+
+      resp = requests.post(webhook, json={"attachments":[{"color":c,"blocks":blocks}]}, timeout=10)
+      if resp.status_code == 200:
+          print("✅ Slack alert sent")
+          print("::set-output name=status::sent")
+      else:
+          print(f"❌ Slack error: {resp.status_code}")
+          print("::set-output name=status::error")
+
+  - id: log-notifications-done
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      ✅ STAGE 4 COMPLETE — Notifications dispatched
+         Slack  : {{ outputs.send-slack-alert.vars.status }}
+         GitHub : {{ outputs.create-github-issue.vars.status }}
+         Issue  : {{ outputs.create-github-issue.vars.issue_url }}
+
+  # ══════════════════════════════════════════════════════════════
+  #  STAGE 5 — INCIDENT REPORT GENERATION
+  # ══════════════════════════════════════════════════════════════
+  - id: stage-5-report
+    type: io.kestra.plugin.core.log.Log
+    message: "📄 STAGE 5 — Generating enterprise incident report..."
+
+  - id: generate-incident-report
+    type: io.kestra.plugin.scripts.python.Script
+    script: |
+      import json, textwrap
+      from datetime import datetime, timezone
+
+      ts = datetime.now(timezone.utc)
+      ts_str = ts.strftime("%Y-%m-%d %H:%M:%S UTC")
+      ts_file = ts.strftime("%Y%m%d-%H%M%S")
+      incident_id = "{{ inputs.incident_id }}"
+      severity = "{{ outputs.ai-analyze.vars.severity }}"
+      failure_type = "{{ inputs.failure_type }}"
+      component = "{{ inputs.component }}"
+      github_url = "{{ outputs.create-github-issue.vars.issue_url }}"
+
+      try:
+          analysis = json.loads('''{{ outputs.ai-analyze.vars.analysis_json }}''')
+      except:
+          analysis = {}
+      try:
+          bundle = json.loads('''{{ outputs.build-log-bundle.vars.bundle_json }}''')
+      except:
+          bundle = {}
+
+      rc  = analysis.get("root_cause", {})
+      rem = analysis.get("remediation", {})
+      biz = analysis.get("business_impact", {})
+      sev_a = analysis.get("severity_assessment", {})
+      metrics = bundle.get("metrics", {})
+      logs = bundle.get("recent_logs", [])
+      patterns = bundle.get("error_patterns", [])
+
+      EMOJI = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","LOW":"🟢"}
+      e = EMOJI.get(severity, "🟠")
+      fd = failure_type.replace("_"," ").title()
+      cd = component.replace("-"," ").title()
+      confidence = int(analysis.get("ai_confidence_score", 0.85) * 100)
+
+      actions_md = "\n".join(
+          f"- [ ] **Step {a.get('step',i+1)}** ({a.get('eta_minutes','?')} min): {a.get('action','')}" + (f"\n  ```bash\n  {a['command']}\n  ```" if a.get("command") else "")
+          for i, a in enumerate(rem.get("immediate_actions",[])[:5])
+      ) or "- [ ] Escalate to on-call engineer"
+
+      log_lines = "\n".join(
+          f"[{l.get('timestamp','')}] {l.get('level','?'):8s}  {l.get('message','')}"
+          for l in logs[:12]
+      ) or "No logs collected"
+
+      patterns_md = "\n".join(f"{i}. `{p}`" for i, p in enumerate(patterns[:6], 1)) or "1. No patterns detected"
+      factors_md  = "\n".join(f"- {f}" for f in rc.get("contributing_factors",[])) or "- Under investigation"
+      short_term  = "\n".join(f"- {f}" for f in rem.get("short_term_fixes",[])) or "- Review post-incident"
+      long_term   = "\n".join(f"- {f}" for f in rem.get("long_term_prevention",[])) or "- Document in post-mortem"
+      github_line = f"\n- 🐙 [GitHub Issue]({github_url})" if github_url else ""
+
+      report = f"""# {e} Incident Report: `{incident_id}`
+
+      **Severity:** {severity} | **Status:** Under Investigation | **Generated:** {ts_str}
+      > *Autonomous AI Incident Response Orchestrator — Kestra + OpenAI GPT-4o*
+
+      ---
+
+      ## Executive Summary
+      A **{severity}** severity incident was detected in `{cd}` (`{fd}`).
+
+      > **AI Root Cause ({confidence}% confidence):** {rc.get('summary','Pending')}
+
+      **Estimated resolution:** {rem.get('estimated_resolution_minutes','TBD')} minutes
+
+      ---
+
+      ## Incident Details
+      | Field | Value |
+      |-------|-------|
+      | Incident ID | `{incident_id}` |
+      | Severity | **{severity}** |
+      | Failure Type | `{fd}` |
+      | Component | `{cd}` |
+      | Detected At | `{ts_str}` |
+      | SLO Breach | `{sev_a.get('slo_breach','Unknown')}` |
+      | Blast Radius | {sev_a.get('blast_radius','Under assessment')} |{github_line}
+
+      **Initial Error:** `{{ inputs.error_message }}`
+
+      ---
+
+      ## 🤖 AI Root Cause Analysis
+      **{rc.get('summary','Pending')}**
+
+      {rc.get('technical_detail','')}
+
+      ### Contributing Factors
+      {factors_md}
+
+      ---
+
+      ## 💼 Business Impact
+      | Area | Assessment |
+      |------|-----------|
+      | Summary | {biz.get('summary','Unknown')} |
+      | Affected Users | {biz.get('affected_users_estimate','TBD')} |
+      | Revenue Risk | {biz.get('revenue_risk','TBD')} |
+      | Compliance | {biz.get('compliance_risk','None identified')} |
+
+      ---
+
+      ## 📊 Metrics at Incident Time
+      | Metric | Value |
+      |--------|-------|
+      | Error Rate | `{metrics.get('error_rate_pct','N/A')}%` |
+      | P99 Latency | `{metrics.get('p99_latency_ms','N/A')} ms` |
+      | CPU | `{metrics.get('cpu_usage_pct','N/A')}%` |
+      | Memory | `{metrics.get('memory_usage_mb','N/A')} MB` |
+      | DB Pool | `{metrics.get('db_pool_active','N/A')}/{metrics.get('db_pool_max',100)}` |
+      | Cache Hit | `{metrics.get('cache_hit_rate_pct','N/A')}%` |
+
+      ---
+
+      ## 🔧 Remediation Plan
+      ### Immediate Actions
+      {actions_md}
+
+      ### Short-term Fixes
+      {short_term}
+
+      ### Long-term Prevention
+      {long_term}
+
+      ---
+
+      ## Detected Error Patterns
+      {patterns_md}
+
+      ## Recent Logs
+      ```log
+      {log_lines}
+      ```
+
+      ---
+
+      ## Timeline
+      | Time | Event |
+      |------|-------|
+      | `{ts_str}` | 🔍 Detected by Kestra health monitor |
+      | `{ts_str}` | 📋 Log + metrics collected (parallel) |
+      | `{ts_str}` | 🤖 AI analysis completed (GPT-4o) |
+      | `{ts_str}` | 💬 Slack alert sent |
+      | `{ts_str}` | 🐙 GitHub issue created |
+      | `{ts_str}` | 📄 Report generated |
+      | ⏳ TBD | 🔧 Resolution |
+
+      ---
+      *Generated by Autonomous AI Incident Response Orchestrator*
+      *Stack: Kestra + FastAPI + OpenAI GPT-4o + Slack + GitHub*
+      """
+
+      print(textwrap.dedent(report))
+      filename = f"incident-{incident_id}-{ts_file}.md"
+      print(f"::set-output name=filename::{filename}")
+      print(f"::set-output name=generated_at::{ts_str}")
+
+  - id: log-report-done
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      ✅ STAGE 5 COMPLETE — Incident report generated
+         File: {{ outputs.generate-incident-report.vars.filename }}
+
+  # ══════════════════════════════════════════════════════════════
+  #  STAGE 6 — FINAL ORCHESTRATION SUMMARY
+  # ══════════════════════════════════════════════════════════════
+  - id: orchestration-complete
+    type: io.kestra.plugin.core.log.Log
+    level: WARN
+    message: |
+      ╔══════════════════════════════════════════════════════════╗
+      ║  ✅ INCIDENT RESPONSE PIPELINE COMPLETE                 ║
+      ╠══════════════════════════════════════════════════════════╣
+      ║  Incident ID    : {{ inputs.incident_id }}
+      ║  Severity       : {{ outputs.ai-analyze.vars.severity }}
+      ║  Root Cause     : {{ outputs.ai-analyze.vars.root_cause_summary }}
+      ║  Fix ETA        : {{ outputs.ai-analyze.vars.resolution_eta }} minutes
+      ║  Slack Alert    : {{ outputs.send-slack-alert.vars.status }}
+      ║  GitHub Issue   : {{ outputs.create-github-issue.vars.status }}
+      ║  GitHub URL     : {{ outputs.create-github-issue.vars.issue_url }}
+      ║  Report File    : {{ outputs.generate-incident-report.vars.filename }}
+      ╚══════════════════════════════════════════════════════════╝
+      🤖 Powered by Kestra Orchestration + OpenAI GPT-4o
+
+errors:
+  - id: pipeline-error-handler
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: |
+      ❌ INCIDENT RESPONSE PIPELINE ERROR
+      Incident : {{ inputs.incident_id }}
+      Error    : {{ errorLogs() }}
+      Action   : Escalate to on-call immediately via PagerDuty

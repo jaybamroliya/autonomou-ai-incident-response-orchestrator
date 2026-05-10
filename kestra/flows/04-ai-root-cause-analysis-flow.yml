@@ -1,0 +1,231 @@
+id: ai-root-cause-analysis
+namespace: ai.incident.response
+
+description: |
+  ## 🤖 AI-Powered Root Cause Analysis
+
+  Sends enriched incident data (logs + metrics + failure context) to OpenAI GPT-4o.
+  Returns structured root cause analysis, remediation steps, severity assessment,
+  and business impact estimate.
+
+  **AI Model:** GPT-4o
+  **Inputs:** Log bundle JSON, incident metadata
+  **Outputs:** Structured AI analysis (root cause, remediation, severity, impact)
+  **SLA:** Must complete within 30 seconds
+
+labels:
+  team: sre
+  env: production
+  tier: ai-analysis
+  criticality: high
+  ai-powered: "true"
+
+inputs:
+  - id: incident_id
+    type: STRING
+  - id: failure_type
+    type: STRING
+  - id: component
+    type: STRING
+  - id: error_message
+    type: STRING
+  - id: severity
+    type: STRING
+    defaults: "HIGH"
+  - id: log_bundle_json
+    type: STRING
+    description: JSON string of the log bundle from log-collection flow
+
+tasks:
+  - id: log-analysis-start
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      🤖 Starting AI root cause analysis
+      Incident: {{ inputs.incident_id }}
+      Failure : {{ inputs.failure_type }}
+      Model   : GPT-4o
+
+  - id: run-ai-analysis
+    type: io.kestra.plugin.scripts.python.Script
+    beforeCommands:
+      - pip install openai --quiet
+    env:
+      OPENAI_API_KEY: "{{ envs.OPENAI_API_KEY }}"
+    script: |
+      import json, os, sys
+      from datetime import datetime, timezone
+      from openai import OpenAI
+
+      client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+      incident_id  = "{{ inputs.incident_id }}"
+      failure_type = "{{ inputs.failure_type }}"
+      component    = "{{ inputs.component }}"
+      error_message = "{{ inputs.error_message }}"
+      severity     = "{{ inputs.severity }}"
+
+      try:
+          bundle = json.loads('''{{ inputs.log_bundle_json }}'''.replace('\n', '\\n'))
+      except:
+          bundle = {"error_patterns": [error_message], "metrics": {}, "log_sample_for_ai": error_message}
+
+      metrics = bundle.get("metrics", {})
+      log_sample = bundle.get("log_sample_for_ai", "No logs available")
+      error_patterns = bundle.get("error_patterns", [])
+
+      # ── System prompt ──────────────────────────────────────────────
+      system_prompt = """You are an expert Site Reliability Engineer (SRE) and AI incident analyst.
+      You analyze production incidents with precision and provide actionable, enterprise-grade analysis.
+      Always respond with valid JSON matching the exact schema requested.
+      Your analysis should be specific, technical, and immediately actionable.
+      Reference exact log lines, metrics thresholds, and concrete remediation commands."""
+
+      # ── User prompt ────────────────────────────────────────────────
+      user_prompt = f"""Analyze the following production incident and provide a comprehensive root cause analysis.
+
+      ## INCIDENT METADATA
+      - Incident ID: {incident_id}
+      - Failure Type: {failure_type}
+      - Affected Component: {component}
+      - Initial Error: {error_message}
+      - Detected Severity: {severity}
+      - Detection Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+      ## SERVICE METRICS AT TIME OF INCIDENT
+      - Error Rate: {metrics.get('error_rate_pct', 'N/A')}%
+      - Average Latency: {metrics.get('avg_latency_ms', 'N/A')} ms
+      - P99 Latency: {metrics.get('p99_latency_ms', 'N/A')} ms
+      - CPU Usage: {metrics.get('cpu_usage_pct', 'N/A')}%
+      - Memory Usage: {metrics.get('memory_usage_mb', 'N/A')} MB
+      - DB Pool Active/Max: {metrics.get('db_pool_active', 'N/A')}/{metrics.get('db_pool_max', 100)}
+      - Cache Hit Rate: {metrics.get('cache_hit_rate_pct', 'N/A')}%
+      - GC Pause: {metrics.get('gc_pause_ms', 'N/A')} ms
+
+      ## RECENT LOG ENTRIES
+      ```
+      {log_sample[:2000]}
+      ```
+
+      ## DETECTED ERROR PATTERNS
+      {chr(10).join(f'- {p}' for p in error_patterns[:8])}
+
+      ## REQUIRED OUTPUT FORMAT
+      Respond with ONLY valid JSON (no markdown, no code blocks) matching this exact schema:
+      {{
+        "root_cause": {{
+          "summary": "1-2 sentence technical summary of the root cause",
+          "technical_detail": "Detailed technical explanation (3-5 sentences)",
+          "contributing_factors": ["factor1", "factor2", "factor3"],
+          "confidence_pct": 85
+        }},
+        "severity_assessment": {{
+          "level": "CRITICAL|HIGH|MEDIUM|LOW",
+          "justification": "Why this severity level",
+          "blast_radius": "What systems/users are affected",
+          "slo_breach": true
+        }},
+        "business_impact": {{
+          "summary": "Business impact in plain English",
+          "affected_users_estimate": "e.g. ~10,000 users",
+          "revenue_risk": "e.g. $15,000/minute at risk",
+          "compliance_risk": "Any regulatory/compliance concerns",
+          "customer_facing": true
+        }},
+        "remediation": {{
+          "immediate_actions": [
+            {{"step": 1, "action": "action description", "command": "exact command if applicable", "eta_minutes": 5}},
+            {{"step": 2, "action": "action description", "command": "exact command if applicable", "eta_minutes": 10}}
+          ],
+          "short_term_fixes": ["fix1", "fix2"],
+          "long_term_prevention": ["prevention1", "prevention2"],
+          "estimated_resolution_minutes": 30,
+          "rollback_available": true
+        }},
+        "runbook_reference": "https://runbooks.internal/incidents/{failure_type.replace('_', '-')}",
+        "similar_past_incidents": ["Brief description of similar past incident if pattern-matched"],
+        "alert_fatigue_risk": "low|medium|high",
+        "auto_remediation_possible": true,
+        "ai_confidence_score": 0.87
+      }}"""
+
+      print("🤖 Calling OpenAI GPT-4o for incident analysis...")
+
+      response = client.chat.completions.create(
+          model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+          messages=[
+              {"role": "system", "content": system_prompt},
+              {"role": "user", "content": user_prompt},
+          ],
+          temperature=0.2,
+          max_tokens=2000,
+          response_format={"type": "json_object"},
+      )
+
+      raw = response.choices[0].message.content
+      analysis = json.loads(raw)
+
+      # Annotate with metadata
+      analysis["incident_id"] = incident_id
+      analysis["analyzed_at"] = datetime.now(timezone.utc).isoformat()
+      analysis["model_used"] = "gpt-4o"
+      analysis["tokens_used"] = response.usage.total_tokens
+
+      print("\n" + "═"*60)
+      print("  AI ROOT CAUSE ANALYSIS COMPLETE")
+      print("═"*60)
+      print(f"  Severity  : {analysis.get('severity_assessment', {}).get('level', 'N/A')}")
+      print(f"  Confidence: {analysis.get('root_cause', {}).get('confidence_pct', 'N/A')}%")
+      print(f"  Root Cause: {analysis.get('root_cause', {}).get('summary', 'N/A')}")
+      print(f"  Impact    : {analysis.get('business_impact', {}).get('summary', 'N/A')}")
+      print(f"  ETA Fix   : {analysis.get('remediation', {}).get('estimated_resolution_minutes', 'N/A')} min")
+      print(f"  Tokens    : {analysis['tokens_used']}")
+      print("═"*60)
+
+      safe_json = json.dumps(analysis).replace("'", "\\'")
+      print(f"::set-output name=analysis_json::{json.dumps(analysis)}")
+      print(f"::set-output name=severity::{analysis.get('severity_assessment', {}).get('level', severity)}")
+      print(f"::set-output name=root_cause_summary::{analysis.get('root_cause', {}).get('summary', '')}")
+      print(f"::set-output name=resolution_eta::{analysis.get('remediation', {}).get('estimated_resolution_minutes', 30)}")
+      print(f"::set-output name=business_impact::{analysis.get('business_impact', {}).get('summary', '')}")
+      print(f"::set-output name=auto_remediation::{analysis.get('auto_remediation_possible', False)}")
+
+  - id: log-analysis-complete
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      ✅ AI Analysis Complete for {{ inputs.incident_id }}
+      ─────────────────────────────────────────
+      Severity      : {{ outputs.run-ai-analysis.vars.severity }}
+      Root Cause    : {{ outputs.run-ai-analysis.vars.root_cause_summary }}
+      Est. Fix Time : {{ outputs.run-ai-analysis.vars.resolution_eta }} minutes
+      Business Impact: {{ outputs.run-ai-analysis.vars.business_impact }}
+      Auto-Remediation: {{ outputs.run-ai-analysis.vars.auto_remediation }}
+      ─────────────────────────────────────────
+
+errors:
+  - id: handle-ai-error
+    type: io.kestra.plugin.scripts.python.Script
+    script: |
+      import json
+      from datetime import datetime, timezone
+
+      fallback = {
+          "root_cause": {
+              "summary": f"AI analysis unavailable — manual investigation required for {{ inputs.failure_type }}",
+              "technical_detail": "OpenAI API call failed. Review logs manually.",
+              "contributing_factors": ["AI service unavailable"],
+              "confidence_pct": 0,
+          },
+          "severity_assessment": {"level": "{{ inputs.severity }}", "justification": "Default escalation"},
+          "business_impact": {"summary": "Unknown — escalate immediately", "customer_facing": True},
+          "remediation": {"immediate_actions": [{"step": 1, "action": "Escalate to on-call engineer", "eta_minutes": 5}]},
+          "incident_id": "{{ inputs.incident_id }}",
+          "analyzed_at": datetime.now(timezone.utc).isoformat(),
+          "model_used": "fallback",
+          "ai_confidence_score": 0.0,
+      }
+      print(f"::set-output name=analysis_json::{json.dumps(fallback)}")
+      print(f"::set-output name=severity::{{ inputs.severity }}")
+      print(f"::set-output name=root_cause_summary::AI analysis unavailable — manual review required")
+      print(f"::set-output name=resolution_eta::60")
+      print(f"::set-output name=business_impact::Unknown — manual investigation required")
+      print("⚠️  Using fallback analysis due to AI service error")
