@@ -164,12 +164,12 @@ autonomous-ai-incident-response-orchestrator/
 ### 1. Clone & Configure
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/autonomous-ai-incident-response-orchestrator
+git clone https://github.com/jaybamroliya/autonomou-ai-incident-response-orchestrator
 cd autonomous-ai-incident-response-orchestrator
 
 # Configure your API keys
 cp .env.example .env
-# Edit .env — at minimum set OPENAI_API_KEY
+# Edit file — at minimum set OPENAI_API_KEY
 ```
 
 ### 2. Start Everything
